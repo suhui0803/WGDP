@@ -40,7 +40,7 @@
     "optimizer": {
         "type": "Adam",
         "args": {
-            "lr": 1.0e-07,
+            "lr": 1.0e-03,
             "eps": 1e-08,
             "weight_decay": 1e-08,
             "amsgrad": false
@@ -49,10 +49,10 @@
     "loss": {
         "type": "mse_loss",
         "args": {
-            "start_pref_e": 1,
-            "limit_pref_e": 1,
-            "start_pref_f": 1,
-            "limit_pref_f": 1,
+            "start_pref_e": 0.001,
+            "limit_pref_e": 0.001,
+            "start_pref_f": 1000,
+            "limit_pref_f": 1000,
             "decay_step_size": 100
         }
     },
@@ -77,4 +77,5 @@
         "early_stop": 100,
         "tensorboard": false
     }
+
 }
