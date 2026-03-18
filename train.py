@@ -11,7 +11,7 @@ from trainer import Trainer
 from utils import prepare_device
 import pathlib
 
-import os 
+import os
 from multiprocessing import cpu_count
 # fix random seeds for reproducibility
 SEED = 123
@@ -22,7 +22,7 @@ np.random.seed(SEED)
 torch.set_printoptions(precision=8)
 #torch.set_default_tensor_type(torch.DoubleTensor)
 
-pathlib.PosixPath = pathlib.WindowsPath
+# pathlib.PosixPath = pathlib.WindowsPath
 
 # cpu_num = cpu_count()
 # os.environ ['OMP_NUM_THREADS'] = str(cpu_num)
@@ -44,7 +44,7 @@ def main(config):
     device, device_ids = prepare_device(config['n_gpu'])
 
     # build model architecture, then print to console
-    model = config.init_obj('arch', module_arch, device=device)
+    model = config.init_obj('arch', module_arch)
     logger.info(model)
     model = model.to(device)
     if len(device_ids) > 1:
