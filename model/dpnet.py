@@ -57,7 +57,7 @@ class GaussRBF(nn.Module):
 
 class BesselRBF(nn.Module):
     """
-    Bessel Radial Basis Function Embedding Module (using l=0 Bessel functions + optional Envelope function)
+    Bessel Radial Basis Function Embedding Module (using l=0 Bessel functions)
     Input:
         zij_label: (M,) label indices
         rij: (M, input_channel_features) distance features
