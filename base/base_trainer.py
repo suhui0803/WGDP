@@ -184,7 +184,7 @@ class BaseTrainer:
         """
         init_path = str(init_path)
         self.logger.info("Loading checkpoint: {} ...".format(init_path))
-        checkpoint = torch.load(init_path,map_location=self.device)
+        checkpoint = torch.load(init_path,map_location=self.device,weights_only=False)
         if checkpoint['config']['arch'] != self.config['arch']:
             self.logger.warning("Warning: Architecture configuration given in config file is different from that of "
                                 "checkpoint. This may yield an exception while state_dict is being loaded.")
