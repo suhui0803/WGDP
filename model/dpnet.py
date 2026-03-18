@@ -3,290 +3,419 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+import inspect
 from collections import OrderedDict
+from typing import Optional, List, Callable
 
-
-class RConv(nn.Module):
-    def __init__(self, label_features: Tensor, output_channel_features: int):
+class GaussRBF(nn.Module):
+    def __init__(self, label_features: int, output_channel_features: int):
         """
-        Gaussian kernel function
-        label_features: zij Indicates the number of type element pairs
-        centres_features: number of centers of a Gaussian function for every zij
+        Args:
+            label_features: Tensor containing the number of type element pairs (scalar tensor).
+            output_channel_features: Number of output features (Gaussian centers).
         """
-        super(RConv, self).__init__()
+        super().__init__()
         self.label_features = label_features
         self.output_channel_features = output_channel_features
-        self.nuww = nn.Parameter(torch.Tensor(self.label_features.item()))
-        self.sigmas = nn.Parameter(torch.Tensor(self.label_features.item()))
-        self.centres = nn.Parameter(torch.Tensor(
-            self.label_features.item(), self.output_channel_features))
-        self.reset_parameters()
 
+        # Gaussian kernel parameters
+        self.nuww = nn.Parameter(torch.Tensor(self.label_features))
+        self.sigmas = nn.Parameter(torch.Tensor(self.label_features))
+        self.centres = nn.Parameter(torch.Tensor(self.label_features, self.output_channel_features))
+
+        self.reset_parameters()
+    
     def reset_parameters(self):
-        nn.init.constant_(self.nuww, -0.05)
-        # nn.init.uniform_(self.nuww,a=-1.0,b=-0.1)
+        nn.init.constant_(self.nuww, -0.1)
         nn.init.constant_(self.sigmas, 4.0)
         nn.init.xavier_normal_(self.centres, gain=1.0)
 
-    def forward(self, zij_label: Tensor, rij: Tensor):
+    def forward(self, zij_label: torch.Tensor, rij: torch.Tensor):
         """
-        zij_label [length]
-        rij [length,channels]
-        out [length,output_channel_features]
+        Args:
+            zij_label: (M,) integer labels, values in [0, self.label_features-1].
+            rij: (M, input_channel_features) input features (e.g., distances).
+        Returns:
+            phi: (M, output_channel_features) Gaussian kernel output.
         """
-        rij = rij.sum(dim=1, keepdim=True)
-        ww = self.nuww.index_select(dim=0, index=zij_label).unsqueeze(-1)
-        sgm = self.sigmas.index_select(dim=0, index=zij_label).unsqueeze(-1)
-        cc = self.centres.index_select(dim=0, index=zij_label)
+        # Select the corresponding parameter type based on the label.
+        ww = self.nuww[zij_label].unsqueeze(-1)   # (M, 1)
+        sgm = self.sigmas[zij_label].unsqueeze(-1) # (M, 1)
+        cc = self.centres[zij_label]   # (M, output_channel_features)
 
-        alpha = (rij - cc) * sgm
-        phi = ww * torch.exp(-1*alpha.pow(2))
+        # Sum along channel dimension to get scalar distance per sample
+        dist = rij.sum(dim=1, keepdim=True)   # (M, 1)
+
+        # Calculate Gaussian Kernel
+        alpha = (dist - cc) * sgm   # (M, output_channel_features)
+        phi = ww * torch.exp(-1*alpha.pow(2))    # (M, output_channel_features)
+
         return phi
 
     def __repr__(self):
-        str = "RConv(label_features={}, output_channel_features={})".format(
-            self.label_features, self.output_channel_features)
-        return str
+        return f"GaussRBF(label_features={self.label_features}, output_channel_features={self.output_channel_features})"
 
-
-def find_neighbors(coords, lattice, rc, batch_size=32):
+class BesselRBF(nn.Module):
     """
+    Bessel Radial Basis Function Embedding Module (using l=0 Bessel functions + optional Envelope function)
+    Input:
+        zij_label: (M,) label indices
+        rij: (M, input_channel_features) distance features
+    Output:
+        phi: (M, output_channel_features)
+    """
+    def __init__(self, label_features: int, output_channel_features: int, cutoff: float):
+        super().__init__()
+        self.label_features = label_features
+        self.output_channel_features = output_channel_features
+        self.cutoff = cutoff
+
+        # wave number k_n = nπ / cutoff
+        k = torch.arange(1, output_channel_features + 1, dtype=torch.float32) * torch.pi / cutoff
+        self.register_buffer("k", k)
+
+        # Weights associated with labels
+        self.nuww = nn.Parameter(torch.Tensor(label_features))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.constant_(self.nuww, -0.1)
+
+    def forward(self, zij_label: torch.Tensor, rij: torch.Tensor):
+         # 1. Sum along channel dimension to get scalar distance per sample
+        dist = rij.sum(dim=1, keepdim=True)   # (M, 1)
+
+        # 2. Calculation k_n * d
+        kd = dist * self.k   # (M, output_channel_features)
+
+        # 3. Spherical Bézier function j0(x) = sin(x)/x
+        rbf = torch.sin(kd) / (kd + 1e-8)       # (M, output_channel_features)
+
+        # 4. Label weighting + Envelope
+        ww = self.nuww[zij_label].unsqueeze(-1)           # (M,1)
+        phi = ww * rbf   # (M, output_channel_features)
+
+        return phi
+
+    def __repr__(self):
+        return f"BesselRBF(label_features={self.label_features}, output_channel_features={self.output_channel_features})"
+
+class LinearRBF(nn.Module):
+    def __init__(self, label_features: int, input_channel_features: int, output_channel_features: int):
+        """
+        Args:
+            label_features: Number of type element pairs.
+            input_channel_features: Number of input channels for rij.
+            output_channel_features: Number of output features.
+        """
+        super().__init__()
+        self.label_features = label_features
+        self.input_channel_features = input_channel_features
+        self.output_channel_features = output_channel_features
+
+        # Type-specific linear transformation parameters
+        self.W = nn.Parameter(torch.Tensor(self.label_features, self.input_channel_features, self.output_channel_features))
+        self.b = nn.Parameter(torch.Tensor(self.label_features, self.output_channel_features))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.W)
+        nn.init.zeros_(self.b)
+
+    def forward(self, zij_label: torch.Tensor, rij: torch.Tensor):
+        """
+        Args:
+            zij_label: (M,) integer labels, values in [0, self.label_features-1].
+            rij: (M, input_channel_features) input features.
+        Returns:
+            phi: (M, output_channel_features) linearly transformed features.
+        """
+        # Select type-specific weights and biases
+        W = self.W[zij_label]          # (M, input_channel_features, output_channel_features)
+        b = self.b[zij_label]          # (M, output_channel_features)
+
+        # Linear transformation
+        rij_trans = torch.einsum('mi,mio->mo', rij, W) + b  # (M, output_channel_features)
+
+        # Optional activation (can be modified or removed)
+        phi = torch.tanh(rij_trans)
+        return phi
+
+    def __repr__(self):
+        return f"LinearRBF(label_features={self.label_features}, input_channel_features={self.input_channel_features}, output_channel_features={self.output_channel_features})"
+    
+def find_neighbors(coords: torch.Tensor, lattice: torch.Tensor, rc: torch.Tensor):
+    """
+    Find neighbors within a cutoff radius considering periodic boundary conditions.
+    Handles non-orthogonal lattices and small unit cells (lattice vectors < rc).
+
     Args:
         coords (torch.Tensor): (N, 3) tensor of atomic coordinates.
         lattice (torch.Tensor): (3, 3) tensor with lattice vectors as rows.
-        rc (float): Cutoff radius.
-        batch_size (int): Number of shifts processed in each batch to balance speed and memory.
+        rc (torch.Tensor): Cutoff radius.
 
     Returns:
-        (pairs, shifts): 
-            pairs (torch.LongTensor): (M, 2) atom pair index [[i],[j]]
-            shifts (torch.LongTensor): (M, 3) displacement vector [k,l,m]
+        pairs (torch.LongTensor): (M, 2) atom pair index [[i], [j]].
+        shifts (torch.LongTensor): (M, 3) displacement vector [n1, n2, n3]
+                                   such that r_j' = r_j + n1*a1 + n2*a2 + n3*a3.
     """
     lattice = lattice.detach()
     coords = coords.detach()
     lattice.requires_grad = False
     coords.requires_grad = False
+
     device = coords.device
-    N = coords.shape[0]
+    dtype = coords.dtype
+    num_atoms = coords.shape[0]
 
-    # Calculate basis vector lengths
-    a, b, c = lattice[0], lattice[1], lattice[2]
-    a_length = torch.norm(a)
-    b_length = torch.norm(b)
-    c_length = torch.norm(c)
+    # Calculate the required expansion factor for each direction.
+    recip_lattice = torch.linalg.inv(lattice).T
+    recip_norm = torch.norm(recip_lattice, dim=1)
+    rep = torch.ceil(rc * recip_norm).int()
+    rep = torch.clamp(rep, min=1)
 
-    # Compute all possible diagonal vectors of the unit cell
-    combinations = torch.tensor([
-        [1, 1, 1], [1, 1, -1], [1, -1, 1], [-1, 1, 1],
-        [1, -1, -1], [-1, 1, -1], [-1, -1, 1], [-1, -1, -1]
-    ], dtype=lattice.dtype, device=device)
-    diag_vectors = torch.matmul(combinations, lattice)
-    diag_norms = torch.norm(diag_vectors, dim=1)
-    unit_cell_diag = torch.max(diag_norms)
+    # Generate integer indices for all displacements (using meshgrid)
+    k_range = torch.arange(-rep[0], rep[0] + 1, device=device)
+    l_range = torch.arange(-rep[1], rep[1] + 1, device=device)
+    m_range = torch.arange(-rep[2], rep[2] + 1, device=device)
+    kk, ll, mm = torch.meshgrid(k_range, l_range, m_range, indexing='ij')
+    shifts_all = torch.stack([kk.reshape(-1), ll.reshape(-1), mm.reshape(-1)], dim=1)  # (P, 3)
 
-   # Calculate maximum shifts with safety margin
-    k_max = torch.ceil((rc + unit_cell_diag) / a_length).int().item()
-    l_max = torch.ceil((rc + unit_cell_diag) / b_length).int().item()
-    m_max = torch.ceil((rc + unit_cell_diag) / c_length).int().item()
+    num_shifts = shifts_all.shape[0]
 
-    # Generate all shift combinations
-    k = torch.arange(-k_max, k_max + 1, device=device)
-    l = torch.arange(-l_max, l_max + 1, device=device)
-    m = torch.arange(-m_max, m_max + 1, device=device)
-    shifts = torch.cartesian_prod(k, l, m)  # (M,3)
+    # Convert integer displacement to a Cartesian coordinate displacement vector
+    shift_vecs = torch.matmul(shifts_all.to(dtype), lattice)   # (num_shifts, 3)
 
-    # Filter shifts within rc + unit cell diagonal
-    shift_norms = torch.norm(shifts.float() @ lattice, dim=1)
-    valid_shifts = shifts[shift_norms <= (rc + unit_cell_diag)]
-    valid_shifts = torch.unique(valid_shifts, dim=0)
+    # Construct the coordinates of all mirrored atoms
+    # image_coords: (num_shifts * num_atoms, 3)
+    image_coords = coords.unsqueeze(0) + shift_vecs.unsqueeze(1)   # (num_shifts, num_atoms, 3)
+    image_coords = image_coords.view(-1, 3)
 
-    # Process shifts in batches
-    pair_list = []
-    shift_list = []
-    num_shifts = valid_shifts.shape[0]
-    for i in range(0, num_shifts, batch_size):
-        batch_shifts = valid_shifts[i:i + batch_size]
-        current_batch_size = batch_shifts.shape[0]
+    # Generate the corresponding index mapping
+    j_indices = torch.arange(num_atoms, device=device).repeat(num_shifts)
+    shift_values = shifts_all.repeat_interleave(num_atoms, dim=0)
 
-        # Compute shifted coordinates for the batch
-        shifted_coords = coords.unsqueeze(
-            0) + (batch_shifts.float() @ lattice).unsqueeze(1)  # (B, N, 3)
+    # Calculate the distance between the original atom and all mirror atoms.
+    # dists: (num_atoms, num_shifts * num_atoms)
+    dists = torch.cdist(coords, image_coords)
 
-        # Compute distances between all atoms and shifted coordinates
-        dists = torch.cdist(coords.unsqueeze(0).expand(
-            current_batch_size, -1, -1), shifted_coords)  # (B, N, N)
+    # Pair selection with distances less than the cutoff radius
+    mask = dists <= rc
+    src_idx, flat_dst_idx = torch.nonzero(mask, as_tuple=True)
 
-        # Process each shift in the current batch
-        for b in range(current_batch_size):
-            shift = batch_shifts[b]
-            dist_matrix = dists[b]
+    # Decoding Target Index and Offset
+    dst_idx = j_indices[flat_dst_idx]
+    final_shifts = shift_values[flat_dst_idx]
 
-            # Apply cutoff and exclude self pairs for zero shift
-            mask = dist_matrix <= rc
-            if torch.all(shift == 0):
-                mask &= ~torch.eye(N, dtype=torch.bool, device=device)
+    # Eliminate self-interactions (i == j and shift == (0,0,0))
+    is_self = (src_idx == dst_idx) & (torch.all(final_shifts == 0, dim=1))
+    valid_mask = ~is_self
 
-            # Collect indices and shifts
-            rows, cols = torch.where(mask)
-            if rows.numel() > 0:
-                pair_list.append(torch.stack([rows, cols], dim=1))
-                shift_list.append(batch_shifts[b].expand(rows.size(0), -1))
-
-    # combined result
-    if not pair_list:
-        return torch.empty((0, 2), dtype=torch.long, device=device), \
-            torch.empty((0, 3), dtype=torch.long, device=device)
-
-    pairs_comb = torch.cat(pair_list, dim=0)
-    shifts_comb = torch.cat(shift_list, dim=0)
-
-    # Remove duplicate pairs elements
-    combined = torch.cat([pairs_comb, shifts_comb], dim=1)
-    unique_combined = torch.unique(combined, dim=0)
-
-    pairs = unique_combined[:, :2].long().T
-    shifts = unique_combined[:, 2:].long()
+    pairs = torch.stack([src_idx[valid_mask], dst_idx[valid_mask]], dim=1)
+    shifts = final_shifts[valid_mask]
 
     return pairs, shifts
 
 
-def find_neighbors_non_periodic(coords, rc):
+def find_neighbors_non_periodic(coords: torch.Tensor, rc: torch.Tensor):
     """
+    Find neighbors for non-periodic configurations (no PBC) using GPU acceleration.
     Args:
         coords (torch.Tensor): (N, 3) tensor of atomic coordinates.
-        rc (float): Cutoff radius.
+        rc (torch.Tensor): Cutoff radius.
+
     Returns:
-        pairs (torch.LongTensor): (M, 2) atom pair index [[i],[j]]
+        pairs (torch.LongTensor): (M, 2) tensor of atom pair indices [[i, j], ...]
     """
     coords = coords.detach()
     coords.requires_grad = False
-    device = coords.device
-    N = coords.shape[0]
+    num_atoms = coords.shape[0]
 
-    # calculate the full distance matrix
+    # Calculate the distance matrix
     dists = torch.cdist(coords, coords)  # (N, N)
 
-    # generate off-diagonal masks (excluding the case of i=j)
-    non_diag_mask = ~torch.eye(N, dtype=torch.bool, device=device)
+    # Filter distances less than rc and exclude self-interactions
+    mask = (dists <= rc) & (~torch.eye(num_atoms, dtype=torch.bool, device=coords.device))
 
-    # combined screening criteria
-    mask = (dists <= rc) & non_diag_mask
+    # Obtain valid neighbor pairs
+    src_idx, dst_idx = torch.nonzero(mask, as_tuple=True)
+    pairs = torch.stack([src_idx, dst_idx], dim=1)
 
-    # gets a valid atom pair
-    rows, cols = torch.where(mask)
-    pairs = torch.stack([rows, cols], dim=1)
-    return pairs.T
+    return pairs
 
 
-def cutoff_cosine(distances: Tensor, cutoff: float):
+def cutoff_cosine(distances: torch.Tensor, cutoff: torch.Tensor):
     # assuming all elements in distances are smaller than cutoff
     return 0.5 * torch.cos(distances * (torch.pi / cutoff)) + 0.5
 
 
 class EmbedSequential(nn.Module):
-    def __init__(self, *args):
-        super(EmbedSequential, self).__init__()
-        if len(args) == 1 and isinstance(args[0], OrderedDict):
-            for key, module in args[0].items():
-                self.add_module(key, module)
-        else:
-            for idx, module in enumerate(args):
-                self.add_module(str(idx), module)
+    """
+    A module that sequentially executes multiple accept operations (zij_label, rij) and returns rij.
+    """
+    def __init__(self, *layers):
+        super().__init__()
+        self.layers = nn.ModuleList(layers)
 
-    def forward(self, zij_label: Tensor, rij: Tensor):
-        for module in self._modules.values():
-            rij = module(zij_label, rij)
+    def forward(self, zij_label, rij):
+        for layer in self.layers:
+            rij = layer(zij_label, rij)
         return rij
 
+def make_embed_layers(label_features: int, out_channels_list: list,
+                      module_name: str = 'GaussRBF', **kwargs):
+    """
+    Construct a sequence of multi-layer RBF units of the specified type,
+    inserting type-specific LayerNorm after each layer (handled by EmbedSequential).
 
-def Make_EmbedLayers(embedding_layers_list: list, label_features: Tensor):
+    Args:
+        label_features: Total number of feature types (scalar tensor).
+        out_channels_list: List of output channels per layer.
+        module_name: Name of the RBF module to use ('GaussRBF', 'BesselRBF', 'LinearRBF').
+        **kwargs: Additional keyword arguments required by the specific module.
+                  The three core arguments (label_features, input_channel_features,
+                  output_channel_features) are automatically injected per layer.
+
+    Returns:
+        EmbedSequential container.
+    """
+    # Map module names to their constructors
+    module_map = {
+        'GaussRBF': GaussRBF,
+        'BesselRBF': BesselRBF,
+        'LinearRBF': LinearRBF,
+    }
+
+    if module_name not in module_map:
+        raise ValueError(f"Unknown module name '{module_name}'. Available: {list(module_map.keys())}")
+
+    module_class = module_map[module_name]
+
     layers = []
-    for v in embedding_layers_list:
-        rconv = RConv(label_features=label_features, output_channel_features=v)
-        layers += [rconv]
+    current_in = 1
+
+    for out_channels in out_channels_list:
+        # Prepare arguments for the current layer
+        # The three fixed arguments
+        layer_kwargs = {
+            'label_features': label_features,
+            'input_channel_features': current_in,
+            'output_channel_features': out_channels,
+        }
+        # Merge with user-provided kwargs (user args override if conflict, but label_features etc. are fixed)
+        layer_kwargs.update(kwargs)
+
+        # Get the signature of the module's __init__ (excluding self)
+        sig = inspect.signature(module_class.__init__)
+        # Filter layer_kwargs to only include parameters that the constructor accepts
+        filtered_kwargs = {}
+        for param_name, param in sig.parameters.items():
+            if param_name == 'self':
+                continue
+            if param_name in layer_kwargs:
+                filtered_kwargs[param_name] = layer_kwargs[param_name]
+            elif param.default is inspect.Parameter.empty:
+                # Required parameter missing
+                raise TypeError(f"Missing required argument '{param_name}' for {module_name}")
+
+        # Create layer
+        layer = module_class(**filtered_kwargs)
+        layers.append(layer)
+        current_in = out_channels
+
     return EmbedSequential(*layers)
 
-
 class Descriptor(nn.Module):
-    def __init__(self, symbol_features: Tensor, embedding_layers: list, Rcut: Tensor,  device: None):
+    def __init__(self, symbol_features: int, embedding_layers_list: list, Rcut: float):
         """
         symbol_features: Number of elements
         Rcut: cutoff radius
         """
-        super(Descriptor, self).__init__()
-        self.symbol_features = symbol_features
-        self.label_features = self.symbol_features * self.symbol_features
-        self.embedding_layers_list = embedding_layers
-        self.Rcut = Rcut
-        self.ZIJ_Label = torch.arange(0, self.label_features, device=device).reshape(
-            (self.symbol_features, self.symbol_features))
-        self.embedding_layers = Make_EmbedLayers(
-            embedding_layers_list=self.embedding_layers_list, label_features=self.label_features)
-
-    def forward(self, boxs: Tensor, numbers: Tensor, coords: Tensor):
+        super().__init__()
+        self.register_buffer('symbol_features', torch.tensor(symbol_features))
+        label_features = symbol_features * symbol_features
+        self.register_buffer('label_features', torch.tensor(label_features))
+        self.register_buffer('Rcut', torch.tensor(Rcut))
+        ZIJ_Label = torch.arange(0, label_features).reshape((symbol_features, symbol_features))
+        self.register_buffer('ZIJ_Label', torch.as_tensor(ZIJ_Label).clone().detach())
+        self.embedding_layers = make_embed_layers(label_features=label_features,out_channels_list=embedding_layers_list,module_name='GaussRBF',cutoff=self.Rcut)
+        
+    def forward(self, boxs: torch.Tensor, numbers: torch.Tensor, coords: torch.Tensor):
         # boxs [n_frames,9]
         # numbers [n_frames,n_atoms]
         # coord [n_frames,n_atoms*3]
-        batch_dij = []
-        for i_cr in range(coords.shape[0]):
-            cell = boxs[i_cr, :].unsqueeze(0).reshape(3, 3)
-            number = numbers[i_cr, :]
-            coordinates = coords[i_cr, :].reshape(-1, 3)
-            if torch.isnan(cell).any():
-                all_pairs = find_neighbors_non_periodic(
-                    coords=coordinates, rc=self.Rcut)
-                pair_vec_distances = (coordinates.index_select(
-                    dim=0, index=all_pairs[1]) - coordinates.index_select(dim=0, index=all_pairs[0]))
+        n_frames = coords.shape[0]
+        n_atoms  = numbers.shape[1]
+        boxs     = boxs.view(n_frames, 3, 3)
+        coords   = coords.view(n_frames, n_atoms, 3)
+
+        batch_dij = []  # Store the atomic dij matrix for each frame
+        for frame_idx in range(n_frames):
+            # Neighbor Search
+            if torch.isnan(boxs[frame_idx]).any():
+                all_pairs = find_neighbors_non_periodic(coords[frame_idx], self.Rcut)
+                # Calculate relative vectors
+                ri = coords[frame_idx][all_pairs[:, 0]]
+                rj = coords[frame_idx][all_pairs[:, 1]]
+                pair_vec_distances = rj - ri
             else:
-                all_pairs, all_shifts = find_neighbors(
-                    coords=coordinates, lattice=cell, rc=self.Rcut)
-                shift_values = all_shifts.to(cell.dtype) @ cell
-                pair_vec_distances = (coordinates.index_select(dim=0, index=all_pairs[1]) + shift_values -
-                                      coordinates.index_select(dim=0, index=all_pairs[0]))
-            all_numbers = number.index_select(
-                dim=0, index=all_pairs.reshape(-1)).reshape(all_pairs.size())
-            all_zij_label = self.ZIJ_Label[all_numbers[0], all_numbers[1]]
-            all_dij = []
-            for i in range(coordinates.shape[0]):
-                mask_label = (all_pairs[0] == i).unsqueeze(-1)
-                rij = torch.masked_select(
-                    pair_vec_distances, mask_label).view(-1, 3)
-                zij_label = torch.masked_select(
-                    all_zij_label.unsqueeze(-1), mask_label)
-                rij_abs = rij.norm(2, -1)
-                rij_angle = rij / rij_abs.unsqueeze(-1)
+                all_pairs, all_shifts = find_neighbors(coords[frame_idx], boxs[frame_idx], self.Rcut) 
+                # Calculate relative vectors
+                ri = coords[frame_idx][all_pairs[:, 0]]
+                rj = coords[frame_idx][all_pairs[:, 1]]
+                shift_cart = torch.matmul(all_shifts.to(boxs.dtype), boxs[frame_idx])
+                pair_vec_distances = rj + shift_cart - ri
 
-                rij_cos = cutoff_cosine(rij_abs, self.Rcut)
-                rij_cos = rij_cos.unsqueeze(-1)  # [length,1]
-                rij_cos_copy = rij_cos
+            # Atomic-pair type coding
+            type_pairs = numbers[frame_idx][all_pairs]
+            pair_zij_label = self.ZIJ_Label[type_pairs[:, 0], type_pairs[:, 1]]
 
-                aij_cos = rij_angle * rij_cos  # [length,3]
+            # Distance, Unit Vector, and Cutoff
+            pair_rij_abs = torch.norm(pair_vec_distances, dim=1, keepdim=True)  # (M,1)
+            pair_rij_unit_vec = pair_vec_distances / (pair_rij_abs + 1e-8)  # (M,3)
+            pair_rij_cutoff = cutoff_cosine(pair_rij_abs, self.Rcut) # (M,1)
 
-                raij = torch.cat((rij_cos, aij_cos), dim=1)  # [length,4]
+            # Construct input features (distance + unit vector) and multiply by the cutoff value.
+            pair_rij_features = torch.cat([pair_rij_cutoff, pair_rij_unit_vec * pair_rij_cutoff], dim=-1)  # (M, 4)
 
-                # [length,output_channel_features]
-                phi = self.embedding_layers(zij_label, rij_cos_copy)
-                phi = phi.squeeze()  # [length,channels]
+            # Obtain the vector for each pair of neighbors through the embedding layer.
+            pair_gij = self.embedding_layers(pair_zij_label, pair_rij_cutoff)  # (M, D)
 
-                raij_out_left = torch.matmul(phi.T, raij)
-                raij_out_right = torch.matmul(raij.T, phi)
-                raij_out = torch.matmul(
-                    raij_out_left, raij_out_right)  # [M1,M2]
-                raij_out = raij_out / torch.norm(raij_out, p='fro')
+            D = pair_gij.size(1)
 
-                dij = raij_out.reshape(shape=(1, -1))
-                all_dij.append(dij.squeeze())
+            # Initialize the accumulator for each atom
+            left_sum = torch.zeros(n_atoms, D, 4, device=pair_gij.device, dtype=pair_gij.dtype)   # (n_atoms, D, 4)
+            right_sum = torch.zeros(n_atoms, 4, D, device=pair_gij.device, dtype=pair_gij.dtype)  # (n_atoms, 4, D)
 
-            all_Dij = torch.stack(all_dij, dim=0)
-            batch_dij.append(all_Dij)
-        Dij = torch.stack(batch_dij, dim=0)
-        return Dij
+            # Compute the outer product contribution for each neighbor
+            left_contrib = pair_gij.unsqueeze(2) * pair_rij_features.unsqueeze(1)  # (M, D, 4)
+            right_contrib = pair_rij_features.unsqueeze(2) * pair_gij.unsqueeze(1)  # (M, 4, D)
+
+            # Accumulate by atomic index (this is equivalent to selecting the corresponding neighbor contribution for each atom)
+            left_sum.scatter_add_(0, all_pairs[:, 0].unsqueeze(-1).unsqueeze(-1).expand(-1, D, 4), left_contrib)
+            right_sum.scatter_add_(0, all_pairs[:, 0].unsqueeze(-1).unsqueeze(-1).expand(-1, 4, D), right_contrib)
+
+            # Calculate dij for each atom dij = left_sum @ right_sum
+            dij_atoms = torch.matmul(left_sum, right_sum)  # (n_atoms, D, D)
+
+            # Frobenius Norm normalization (avoiding division by zero)
+            norm = torch.norm(dij_atoms, dim=(1,2), p='fro')  # (n_atoms,)
+            norm = torch.where(norm > 0, norm, torch.ones_like(norm))
+            dij_atoms = dij_atoms / norm.unsqueeze(-1).unsqueeze(-1) # (n_atoms, D, D)
+            dij_atoms = dij_atoms.reshape(n_atoms,-1)
+
+            batch_dij.append(dij_atoms)  #(n_atoms, D*D)
+
+        # Stack the results of all frames
+        return torch.stack(batch_dij, dim=0)  # (n_frames, n_atoms, D*D)
 
 
 class NormLayer(nn.Module):
     def __init__(self, norm_type, num_features, eps=1e-6, momentum=0.1, affine=True,
                  track_running_stats=True, elementwise_affine=True):
-        super(NormLayer, self).__init__()
+        super().__init__()
         self.norm_type = norm_type.lower()
         if self.norm_type == 'batch':
             self.norm = nn.BatchNorm1d(num_features=num_features, eps=eps, momentum=momentum,
@@ -298,13 +427,13 @@ class NormLayer(nn.Module):
             raise ValueError(
                 f"Unsupported normalization type: {self.norm_type}")
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
         return self.norm(x)
 
 
 class ResidualFCBlock(nn.Module):
-    def __init__(self, input_size, hidden_size, lnorm: bool, bias: bool, norm_type='layer'):
-        super(ResidualFCBlock, self).__init__()
+    def __init__(self, input_size:int, hidden_size:int, lnorm: bool, bias: bool, norm_type='layer'):
+        super().__init__()
         if lnorm == True:
             self.base_layer1 = nn.Sequential(nn.Linear(in_features=input_size, out_features=hidden_size, bias=bias),
                                              NormLayer(norm_type=norm_type, num_features=hidden_size))
@@ -326,7 +455,7 @@ class ResidualFCBlock(nn.Module):
         else:
             self.shortcut = nn.Identity()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
         residual = x
         x = self.base_layer1(x)
         x = self.activation(x)
@@ -357,37 +486,32 @@ def Make_ResidualFCBlock(cfg: list, input_size: int, ouput_size: int, lnorm: boo
     layers += [nn.Linear(cfg[-1], ouput_size, bias=bias)]
     return nn.Sequential(*layers)
 
-# model
-
-
 class DPNET(nn.Module):
-    def __init__(self, symbol_features: int, embedding_layers: list, Rcut: float, fitting_layers: list, lnorm: bool, norm_type: str, bias: bool, device: None, initialize_weights=True):
-        super(DPNET, self).__init__()
-        self.symbol_features = torch.tensor(symbol_features, device=device)
+    def __init__(self, symbol_features: int, embedding_layers: list, Rcut: float, fitting_layers: list, lnorm: bool, norm_type: str, bias: bool, initialize_weights=True):
+        super().__init__()
+        self.symbol_features = symbol_features
         self.embedding_layers_list = embedding_layers
-        self.Rcut = torch.tensor(Rcut, device=device)
+        self.Rcut = Rcut
         self.fitting_layers_list = fitting_layers
         self.lnorm = lnorm
         self.norm_type = norm_type
         self.bias = bias
-        self.descriptor = Descriptor(symbol_features=self.symbol_features,
-                                     embedding_layers=self.embedding_layers_list, Rcut=self.Rcut, device=device)
-        self.fc_input_features = self.embedding_layers_list[-1] * \
-            self.embedding_layers_list[-1]
-        self.fitting_layers = Make_ResidualFCBlock(
-            self.fitting_layers_list, self.fc_input_features, 1, lnorm=self.lnorm, bias=self.bias, norm_type=self.norm_type)
+        self.descriptor = Descriptor(symbol_features=self.symbol_features,embedding_layers_list=self.embedding_layers_list, Rcut=self.Rcut)
+        self.fc_input_features = self.embedding_layers_list[-1] * self.embedding_layers_list[-1]
+        self.fitting_layer = Make_ResidualFCBlock(self.fitting_layers_list, self.fc_input_features, 1, lnorm=self.lnorm, bias=self.bias, norm_type=self.norm_type)
         if initialize_weights == True:
             self._initialize_weights()
 
-    def forward(self, boxs: Tensor, numbers: Tensor, coords: Tensor):
-        # [n_frames,n_atomsx3]
-        # [n_frames,n_atoms,mm_features]
+    def forward(self, boxs: torch.Tensor, numbers: torch.Tensor, coords: torch.Tensor):
+        # boxs [n_frames,3*3]
+        # numbers [n_frames,n_atoms]
+        # coords[n_frames,n_atomsx3]
         x = self.descriptor(boxs, numbers, coords)
         bs, natoms, mm = x.shape
         x = x.reshape(bs*natoms, mm)
         # N = bs*natoms
 
-        atom_energy = self.fitting_layers(x)  # [N]
+        atom_energy = self.fitting_layer(x)  # [N]
         frame_energy = atom_energy.reshape(bs, -1)  # [bs,natoms]
         energy = torch.sum(frame_energy, dim=-1, keepdim=True)  # [bs,1]
         return energy
