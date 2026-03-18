@@ -40,7 +40,7 @@ class Trainer(BaseTrainer):
         :param epoch: Integer, current training epoch.
         :return: A log that contains average loss and metric in this epoch.
         """
-        training_start_time = time.time()
+        # training_start_time = time.time()
         
         self.model.train()
         
@@ -50,6 +50,7 @@ class Trainer(BaseTrainer):
         train_dataset_path = self.train_data_loader.get_selected_system_set()
         train_batches = self.train_data_loader.get_num_batches()
 
+        training_start_time = time.time()
         for batch_idx, data in enumerate(train_loader):
             boxs, numbers, coords, force, energy = data
             boxs = boxs.to(self.device)
@@ -93,13 +94,14 @@ class Trainer(BaseTrainer):
 
             if batch_idx == train_batches:
                 break
-        if self.lr_scheduler is not None:
-            self.lr_scheduler.step()
-                
-        log = self.train_metrics.result()
+        
         training_end_time = time.time()
         training_time = training_end_time - training_start_time
 
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
+
+        log = self.train_metrics.result()
         log.update({"lr":self.lr_scheduler.get_last_lr()[0]})
         log.update({"train_dataset":train_dataset_path})
         log.update({"training_time":training_time})
@@ -119,7 +121,7 @@ class Trainer(BaseTrainer):
         :param epoch: Integer, current training epoch.
         :return: A log that contains information about validation
         """
-        validating_start_time = time.time()
+        # validating_start_time = time.time()
         if epoch % self.select_system_update_interval == 0:
             valid_loader = self.valid_data_loader.step()
         valid_dataset_path = self.valid_data_loader.get_selected_system_set()
@@ -128,6 +130,7 @@ class Trainer(BaseTrainer):
         self.model.eval()
         self.valid_metrics.reset()
 
+        validating_start_time = time.time()
         for batch_idx, data in enumerate(valid_loader):
             boxs, numbers, coords, force, energy = data
             boxs = boxs.to(self.device)
