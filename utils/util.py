@@ -1,6 +1,6 @@
 import json
 import torch
-import pandas as pd
+# import pandas as pd
 from pathlib import Path
 from itertools import repeat
 from collections import OrderedDict
@@ -39,28 +39,55 @@ def prepare_device(n_gpu_use):
     list_ids = list(range(n_gpu_use))
     return device, list_ids
 
+# class MetricTracker:
+#     def __init__(self, *keys, writer=None):
+#         self.writer = writer
+#         self._data = pd.DataFrame(index=keys, columns=['total', 'counts', 'average'])
+#         self.reset()
+
+#     def reset(self):
+#         for col in self._data.columns:
+#             self._data[col].values[:] = 0
+
+#     def update(self, key, value, n=1):
+#         if self.writer is not None:
+#             self.writer.add_scalar(key, value)
+#         self._data.total[key] += value * n
+#         self._data.counts[key] += n
+#         self._data.average[key] = self._data.total[key] / self._data.counts[key]
+
+#     def avg(self, key):
+#         return self._data.average[key]
+
+#     def result(self):
+#         return dict(self._data.average)
+
 class MetricTracker:
     def __init__(self, *keys, writer=None):
         self.writer = writer
-        self._data = pd.DataFrame(index=keys, columns=['total', 'counts', 'average'])
+        # Use nested dictionaries to store each metric: total、counts 和 average
+        self._data = {key: {'total': 0.0, 'counts': 0, 'average': 0.0} for key in keys}
         self.reset()
 
     def reset(self):
-        for col in self._data.columns:
-            self._data[col].values[:] = 0
+        for key in self._data:
+            self._data[key]['total'] = 0.0
+            self._data[key]['counts'] = 0
+            self._data[key]['average'] = 0.0
 
     def update(self, key, value, n=1):
         if self.writer is not None:
             self.writer.add_scalar(key, value)
-        self._data.total[key] += value * n
-        self._data.counts[key] += n
-        self._data.average[key] = self._data.total[key] / self._data.counts[key]
+        self._data[key]['total'] += value * n
+        self._data[key]['counts'] += n
+        self._data[key]['average'] = self._data[key]['total'] / self._data[key]['counts']
 
     def avg(self, key):
-        return self._data.average[key]
+        return self._data[key]['average']
 
     def result(self):
-        return dict(self._data.average)
+        return {key: self._data[key]['average'] for key in self._data}
+
 
 def convert_path(path: str) -> str:
     return path.replace(r'\/'.replace(os.sep, ''), os.sep)
